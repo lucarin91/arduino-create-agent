@@ -22,7 +22,9 @@ import (
 	_ "embed"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
@@ -45,6 +47,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-ini/ini"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/websocket"
+	"tinygo.org/x/bluetooth"
 	//"github.com/sanbornm/go-selfupdate/selfupdate" #included in update.go to change heavily
 )
 
@@ -139,6 +143,9 @@ func main() {
 	// Launch main loop in a goroutine
 	go loop()
 
+	// run ble servers
+	go ble()
+
 	// SetupSystray is the main thread
 	configDir := config.GetDefaultConfigDir()
 	Systray = systray.Systray{
@@ -157,6 +164,239 @@ func main() {
 		Systray.RestartWith(restartPath)
 	} else {
 		Systray.Start()
+	}
+}
+
+var allowOriginFunc = func(r *http.Request) bool {
+	return true
+}
+
+// {"jsonrpc":"2.0","method":"discover","params":{"filters":[{"services":[61445]}]},"id":0}
+
+type Msg struct {
+	Id      int         `json:"id"`
+	Jsonrpc string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params"`
+}
+
+func NewMsg(method string, params interface{}) Msg {
+	return Msg{
+		Id:      0,
+		Jsonrpc: "2.0",
+		Method:  method,
+		Params:  params,
+	}
+}
+
+type Device struct {
+	PeripheralId string `json:"peripheralId"`
+	Name         string `json:"name"`
+	RSSI         int16  `json:"rssi"`
+}
+
+type DiscoverParameter struct {
+	Filters []DiscoverFilter
+}
+
+type DiscoverFilter struct {
+	Name       string
+	NamePrefix string
+	Services   []string
+}
+
+func DiscoverParameterFromMap(i interface{}) DiscoverParameter {
+	m := i.(map[string]interface{})
+	var filters []DiscoverFilter
+	for _, f := range m["filters"].([]interface{}) {
+		inner := f.(map[string]interface{})
+		var name string
+		if x, ok := inner["name"]; ok {
+			name = x.(string)
+		}
+		var namePrefix string
+		if x, ok := inner["namePrefix"]; ok {
+			namePrefix = x.(string)
+		}
+		var services []string
+		if x, ok := inner["services"]; ok {
+			xx := x.([]interface{})
+			for _, xxx := range xx {
+				services = append(services, xxx.(string))
+			}
+		}
+
+		filters = append(filters, DiscoverFilter{Name: name, NamePrefix: namePrefix, Services: services})
+	}
+	return DiscoverParameter{Filters: filters}
+}
+
+type ConnectParameter struct {
+	PeripheralId string
+}
+
+func ConnectParameterFromMap(i interface{}) ConnectParameter {
+	m := i.(map[string]interface{})
+	return ConnectParameter{PeripheralId: m["peripheralId"].(string)}
+}
+
+func ble() {
+	var adapter = bluetooth.DefaultAdapter
+
+	if err := adapter.Enable(); err != nil {
+		fmt.Printf("BLE not enabled: %s", err)
+	}
+
+	http.Handle("/scratch/ble", websocket.Handler(func(c *websocket.Conn) {
+		fmt.Println("CONNECT")
+
+		for {
+			buff := make([]byte, 512)
+			n, err := c.Read(buff)
+			if err == io.EOF {
+				continue
+			}
+			if err != nil {
+				fmt.Printf("err: %s\n", err)
+				continue
+			}
+			if n >= 512 {
+				panic("too big")
+			}
+			fmt.Printf("[DEBUG] read message: %s\n", string(buff))
+
+			var msg Msg
+			err = json.Unmarshal(buff[:n], &msg)
+			if err != nil {
+				fmt.Printf("err: %s\n", err)
+				continue
+			}
+
+			switch msg.Method {
+			case "discover":
+
+				params := DiscoverParameterFromMap(msg.Params)
+				fmt.Println(msg.Params, params)
+
+				println("scanning...")
+				err = adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
+					if len(device.LocalName()) == 0 {
+						return
+					}
+
+					println("found device:", device.Address.String(), device.RSSI, device.LocalName())
+
+					MatchFilter := func(device bluetooth.ScanResult, filters []DiscoverFilter) bool {
+						// export function matchesFilter(device: Device, filter: Filter) {
+						//   return (
+						//     (filter.name === undefined ||
+						//       device.Name?.value === filter.name ||
+						//       device.Alias?.value === filter.name) &&
+						//     (filter.namePrefix === undefined ||
+						//       (device.Name?.value ?? "").startsWith(filter.namePrefix) ||
+						//       (device.Alias?.value ?? "").startsWith(filter.namePrefix)) &&
+						//     !filter.services?.some(
+						//       (uuid) => !(device.UUIDs?.value ?? []).includes(uuid)
+						//     ) &&
+						//     (filter.manufacturerData === undefined ||
+						//       (device.ManufacturerData &&
+						//         !Object.entries(filter.manufacturerData).some(([id, value]) => {
+						//           const buff = device.ManufacturerData!.value[id]?.value;
+
+						//	          return (
+						//	            !buff ||
+						//	            value.mask.length > buff.length ||
+						//	            value.mask.some(
+						//	              (_, i) =>
+						//	                (buff.readUInt8(i) & value.mask[i]) !== value.dataPrefix[i]
+						//	            )
+						//	          );
+						//	        })))
+						//	  );
+						//	}
+
+						for _, filter := range filters {
+							if len(filter.Name) != 0 && filter.Name != device.LocalName() {
+								return false
+							}
+
+							for _, service := range filter.Services {
+								uuid, err := bluetooth.ParseUUID(service)
+								if err != nil {
+									panic(err)
+								}
+								if !device.HasServiceUUID(uuid) {
+									return false
+								}
+							}
+						}
+						return true
+					}
+
+					if !MatchFilter(device, params.Filters) {
+						return
+					}
+
+					fmt.Println("stop scan")
+					if err := adapter.StopScan(); err != nil {
+						panic(err)
+					}
+
+					msg := NewMsg("didDiscoverPeripheral", Device{
+						PeripheralId: device.Address.String(),
+						Name:         device.LocalName(),
+						RSSI:         device.RSSI,
+					})
+					buff, err := json.Marshal(msg)
+					if err != nil {
+						fmt.Printf("err: %s", err)
+						return
+					}
+					_, err = c.Write(buff)
+					if err != nil {
+						fmt.Printf("err: %s", err)
+					}
+				})
+				if err != nil {
+					fmt.Printf("error: %s", err)
+				}
+			case "connect":
+				params := ConnectParameterFromMap(msg.Params)
+				mac := bluetooth.MACAddress{}
+				mac.Set(params.PeripheralId)
+				d, err := adapter.Connect(bluetooth.Address{
+					MACAddress: mac,
+				}, bluetooth.ConnectionParams{
+					ConnectionTimeout: 0,
+					MinInterval:       0,
+					MaxInterval:       0,
+				})
+				if err != nil {
+					panic(err)
+				}
+				fmt.Printf("device: %+v\n", d)
+
+				msg := NewMsg("characteristicChange", nil)
+				buff, err := json.Marshal(msg)
+				if err != nil {
+					fmt.Printf("err: %s", err)
+					return
+				}
+				_, err = c.Write(buff)
+				if err != nil {
+					fmt.Printf("err: %s", err)
+				}
+
+			default:
+				fmt.Println("unknown command", msg.Method)
+			}
+		}
+
+	}))
+	// err := http.ListenAndServeTLS(":20111", "server.crt", "server.key", nil)
+	err := http.ListenAndServeTLS(":20110", "server.crt", "server.key", nil)
+	if err != nil {
+		panic("ListenAndServe: " + err.Error())
 	}
 }
 
