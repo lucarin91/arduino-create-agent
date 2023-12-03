@@ -189,6 +189,20 @@ func NewMsg(method string, params interface{}) Msg {
 	}
 }
 
+type Result struct {
+	Id      int         `json:"id"`
+	Jsonrpc string      `json:"jsonrpc"`
+	Result  interface{} `json:"result"`
+}
+
+func NewResult(id int, result interface{}) Result {
+	return Result{
+		Id:      id,
+		Jsonrpc: "2.0",
+		Result:  result,
+	}
+}
+
 type Device struct {
 	PeripheralId string `json:"peripheralId"`
 	Name         string `json:"name"`
@@ -376,8 +390,8 @@ func ble() {
 				}
 				fmt.Printf("device: %+v\n", d)
 
-				msg := NewMsg("characteristicChange", nil)
-				buff, err := json.Marshal(msg)
+				res := NewResult(msg.Id, nil)
+				buff, err := json.Marshal(res)
 				if err != nil {
 					fmt.Printf("err: %s", err)
 					return
@@ -386,6 +400,9 @@ func ble() {
 				if err != nil {
 					fmt.Printf("err: %s", err)
 				}
+
+			case "startNotifications":
+				// TOO: implement
 
 			default:
 				fmt.Println("unknown command", msg.Method)
