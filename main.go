@@ -20,6 +20,7 @@ package main
 
 import (
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -46,6 +48,7 @@ import (
 	paths "github.com/arduino/go-paths-helper"
 	"github.com/gin-gonic/gin"
 	"github.com/go-ini/ini"
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/websocket"
 	"tinygo.org/x/bluetooth"
@@ -171,36 +174,49 @@ var allowOriginFunc = func(r *http.Request) bool {
 	return true
 }
 
-// {"jsonrpc":"2.0","method":"discover","params":{"filters":[{"services":[61445]}]},"id":0}
+var MsgID int64 = 0
 
 type Msg struct {
-	Id      int         `json:"id"`
-	Jsonrpc string      `json:"jsonrpc"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params"`
+	Id      int64           `json:"id"`
+	Jsonrpc string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
 }
 
 func NewMsg(method string, params interface{}) Msg {
+	buff, err := json.Marshal(params)
+	if err != nil {
+		panic(err)
+	}
 	return Msg{
-		Id:      0,
+		Id:      atomic.AddInt64(&MsgID, 1),
 		Jsonrpc: "2.0",
 		Method:  method,
-		Params:  params,
+		Params:  json.RawMessage(buff),
 	}
 }
 
-type Result struct {
-	Id      int         `json:"id"`
-	Jsonrpc string      `json:"jsonrpc"`
-	Result  interface{} `json:"result"`
-}
-
-func NewResult(id int, result interface{}) Result {
+func (m Msg) Respond(result interface{}) Result {
 	return Result{
-		Id:      id,
+		Id:      m.Id,
 		Jsonrpc: "2.0",
 		Result:  result,
 	}
+}
+
+func (m Msg) DebugParams() map[string]interface{} {
+	var out map[string]interface{}
+	err := json.Unmarshal(m.Params, &out)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+type Result struct {
+	Id      int64       `json:"id"`
+	Jsonrpc string      `json:"jsonrpc"`
+	Result  interface{} `json:"result"`
 }
 
 type Device struct {
@@ -209,49 +225,115 @@ type Device struct {
 	RSSI         int16  `json:"rssi"`
 }
 
-type DiscoverParameter struct {
-	Filters []DiscoverFilter
+type DiscoverParams struct {
+	Filters []DiscoverFilter `json:"filters"`
 }
 
 type DiscoverFilter struct {
-	Name       string
-	NamePrefix string
-	Services   []string
+	Name       string      `json:"name"`
+	NamePrefix string      `json:"namePrefix"`
+	Services   []uuid.UUID `json:"services"`
 }
 
-func DiscoverParameterFromMap(i interface{}) DiscoverParameter {
-	m := i.(map[string]interface{})
-	var filters []DiscoverFilter
-	for _, f := range m["filters"].([]interface{}) {
-		inner := f.(map[string]interface{})
-		var name string
-		if x, ok := inner["name"]; ok {
-			name = x.(string)
+type ConnectParams struct {
+	PeripheralId string `json:"peripheralId"`
+}
+
+type StartNotificationsParams struct {
+	ServiceId        uuid.UUID `json:"serviceId"`
+	CharacteristicId uuid.UUID `json:"characteristicId"`
+}
+
+type UpdateParams struct {
+	ServiceId        uuid.UUID `json:"serviceId"`
+	CharacteristicId uuid.UUID `json:"characteristicId"`
+	Message          string    `json:"message"`
+	Encoding         string    `json:"encoding"`
+}
+
+func WsSend(c *websocket.Conn, data interface{}) error {
+	buff, err := json.Marshal(data)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = c.Write(buff)
+	if err != nil {
+		return fmt.Errorf("ws write error: %w", err)
+	}
+
+	return nil
+}
+
+func WsRead(c *websocket.Conn) (Msg, error) {
+	buff := make([]byte, 512)
+	var msg Msg
+	for {
+		n, err := c.Read(buff)
+		if err == io.EOF {
+			continue
 		}
-		var namePrefix string
-		if x, ok := inner["namePrefix"]; ok {
-			namePrefix = x.(string)
+		if err != nil {
+			return msg, fmt.Errorf("ws read error: %w", err)
 		}
-		var services []string
-		if x, ok := inner["services"]; ok {
-			xx := x.([]interface{})
-			for _, xxx := range xx {
-				services = append(services, xxx.(string))
+		if n >= 512 {
+			panic("too big")
+		}
+
+		err = json.Unmarshal(buff[:n], &msg)
+		if err != nil {
+			return msg, fmt.Errorf("ws read error: %w", err)
+		}
+		if len(msg.Method) == 0 {
+			// result message
+			continue
+		}
+
+		return msg, nil
+	}
+}
+
+func matchDevice(device bluetooth.ScanResult, filters []DiscoverFilter) bool {
+	// export function matchesFilter(device: Device, filter: Filter) {
+	//   return (
+	//     (filter.name === undefined ||
+	//       device.Name?.value === filter.name ||
+	//       device.Alias?.value === filter.name) &&
+	//     (filter.namePrefix === undefined ||
+	//       (device.Name?.value ?? "").startsWith(filter.namePrefix) ||
+	//       (device.Alias?.value ?? "").startsWith(filter.namePrefix)) &&
+	//     !filter.services?.some(
+	//       (uuid) => !(device.UUIDs?.value ?? []).includes(uuid)
+	//     ) &&
+	//     (filter.manufacturerData === undefined ||
+	//       (device.ManufacturerData &&
+	//         !Object.entries(filter.manufacturerData).some(([id, value]) => {
+	//           const buff = device.ManufacturerData!.value[id]?.value;
+
+	//	          return (
+	//	            !buff ||
+	//	            value.mask.length > buff.length ||
+	//	            value.mask.some(
+	//	              (_, i) =>
+	//	                (buff.readUInt8(i) & value.mask[i]) !== value.dataPrefix[i]
+	//	            )
+	//	          );
+	//	        })))
+	//	  );
+	//	}
+
+	for _, filter := range filters {
+		if len(filter.Name) != 0 && filter.Name != device.LocalName() {
+			return false
+		}
+
+		for _, service := range filter.Services {
+			if !device.HasServiceUUID(bluetooth.NewUUID(service)) {
+				return false
 			}
 		}
-
-		filters = append(filters, DiscoverFilter{Name: name, NamePrefix: namePrefix, Services: services})
 	}
-	return DiscoverParameter{Filters: filters}
-}
-
-type ConnectParameter struct {
-	PeripheralId string
-}
-
-func ConnectParameterFromMap(i interface{}) ConnectParameter {
-	m := i.(map[string]interface{})
-	return ConnectParameter{PeripheralId: m["peripheralId"].(string)}
+	return true
 }
 
 func ble() {
@@ -264,23 +346,10 @@ func ble() {
 	http.Handle("/scratch/ble", websocket.Handler(func(c *websocket.Conn) {
 		fmt.Println("CONNECT")
 
-		for {
-			buff := make([]byte, 512)
-			n, err := c.Read(buff)
-			if err == io.EOF {
-				continue
-			}
-			if err != nil {
-				fmt.Printf("err: %s\n", err)
-				continue
-			}
-			if n >= 512 {
-				panic("too big")
-			}
-			fmt.Printf("[DEBUG] read message: %s\n", string(buff))
+		var DEVICE *bluetooth.Device
 
-			var msg Msg
-			err = json.Unmarshal(buff[:n], &msg)
+		for {
+			msg, err := WsRead(c)
 			if err != nil {
 				fmt.Printf("err: %s\n", err)
 				continue
@@ -288,11 +357,14 @@ func ble() {
 
 			switch msg.Method {
 			case "discover":
+				var params DiscoverParams
+				err := json.Unmarshal(msg.Params, &params)
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
 
-				params := DiscoverParameterFromMap(msg.Params)
-				fmt.Println(msg.Params, params)
-
-				println("scanning...")
+				fmt.Println("scanning...")
 				err = adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
 					if len(device.LocalName()) == 0 {
 						return
@@ -300,60 +372,13 @@ func ble() {
 
 					println("found device:", device.Address.String(), device.RSSI, device.LocalName())
 
-					MatchFilter := func(device bluetooth.ScanResult, filters []DiscoverFilter) bool {
-						// export function matchesFilter(device: Device, filter: Filter) {
-						//   return (
-						//     (filter.name === undefined ||
-						//       device.Name?.value === filter.name ||
-						//       device.Alias?.value === filter.name) &&
-						//     (filter.namePrefix === undefined ||
-						//       (device.Name?.value ?? "").startsWith(filter.namePrefix) ||
-						//       (device.Alias?.value ?? "").startsWith(filter.namePrefix)) &&
-						//     !filter.services?.some(
-						//       (uuid) => !(device.UUIDs?.value ?? []).includes(uuid)
-						//     ) &&
-						//     (filter.manufacturerData === undefined ||
-						//       (device.ManufacturerData &&
-						//         !Object.entries(filter.manufacturerData).some(([id, value]) => {
-						//           const buff = device.ManufacturerData!.value[id]?.value;
-
-						//	          return (
-						//	            !buff ||
-						//	            value.mask.length > buff.length ||
-						//	            value.mask.some(
-						//	              (_, i) =>
-						//	                (buff.readUInt8(i) & value.mask[i]) !== value.dataPrefix[i]
-						//	            )
-						//	          );
-						//	        })))
-						//	  );
-						//	}
-
-						for _, filter := range filters {
-							if len(filter.Name) != 0 && filter.Name != device.LocalName() {
-								return false
-							}
-
-							for _, service := range filter.Services {
-								uuid, err := bluetooth.ParseUUID(service)
-								if err != nil {
-									panic(err)
-								}
-								if !device.HasServiceUUID(uuid) {
-									return false
-								}
-							}
-						}
-						return true
-					}
-
-					if !MatchFilter(device, params.Filters) {
+					if !matchDevice(device, params.Filters) {
 						return
 					}
 
-					fmt.Println("stop scan")
 					if err := adapter.StopScan(); err != nil {
-						panic(err)
+						fmt.Printf("err: %s\n", err)
+						return
 					}
 
 					msg := NewMsg("didDiscoverPeripheral", Device{
@@ -361,24 +386,27 @@ func ble() {
 						Name:         device.LocalName(),
 						RSSI:         device.RSSI,
 					})
-					buff, err := json.Marshal(msg)
+					err := WsSend(c, msg)
 					if err != nil {
 						fmt.Printf("err: %s", err)
 						return
 					}
-					_, err = c.Write(buff)
-					if err != nil {
-						fmt.Printf("err: %s", err)
-					}
 				})
 				if err != nil {
 					fmt.Printf("error: %s", err)
+					continue
 				}
 			case "connect":
-				params := ConnectParameterFromMap(msg.Params)
+				var params ConnectParams
+				err := json.Unmarshal(msg.Params, &params)
+				if err != nil {
+					fmt.Printf("error: %s", err)
+					continue
+				}
+
 				mac := bluetooth.MACAddress{}
 				mac.Set(params.PeripheralId)
-				d, err := adapter.Connect(bluetooth.Address{
+				DEVICE, err = adapter.Connect(bluetooth.Address{
 					MACAddress: mac,
 				}, bluetooth.ConnectionParams{
 					ConnectionTimeout: 0,
@@ -386,26 +414,88 @@ func ble() {
 					MaxInterval:       0,
 				})
 				if err != nil {
-					panic(err)
+					fmt.Printf("error: %s", err)
+					continue
 				}
-				fmt.Printf("device: %+v\n", d)
+				fmt.Printf("device: %+v\n", *DEVICE)
 
-				res := NewResult(msg.Id, nil)
-				buff, err := json.Marshal(res)
+				err = WsSend(c, msg.Respond(nil))
 				if err != nil {
 					fmt.Printf("err: %s", err)
 					return
 				}
-				_, err = c.Write(buff)
-				if err != nil {
-					fmt.Printf("err: %s", err)
-				}
 
 			case "startNotifications":
-				// TOO: implement
+				var params StartNotificationsParams
+				err := json.Unmarshal(msg.Params, &params)
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+				fmt.Printf("startNotifications params: %+v\n", params)
 
+				services, err := DEVICE.DiscoverServices([]bluetooth.UUID{bluetooth.NewUUID(params.ServiceId)})
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
+				chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{bluetooth.NewUUID(params.CharacteristicId)})
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
+				chars[0].EnableNotifications(func(buf []byte) {
+					// fmt.Printf("get char notification: %v\n", buf)
+					err := WsSend(c, NewMsg("characteristicDidChange", UpdateParams{
+						ServiceId:        params.ServiceId,
+						CharacteristicId: params.CharacteristicId,
+						Message:          base64.StdEncoding.EncodeToString(buf),
+						Encoding:         "base64",
+					}))
+					if err != nil {
+						fmt.Printf("err: %s\n", err)
+					}
+				})
+			case "write":
+				var params UpdateParams
+				err := json.Unmarshal(msg.Params, &params)
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+				fmt.Printf("write params: %+v\n", params)
+
+				services, err := DEVICE.DiscoverServices([]bluetooth.UUID{bluetooth.NewUUID(params.ServiceId)})
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
+				chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{bluetooth.NewUUID(params.CharacteristicId)})
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+				char := chars[0]
+
+				if params.Encoding != "base64" {
+					panic("encoding format not supported")
+				}
+
+				buf, err := base64.StdEncoding.DecodeString(params.Message)
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+				_, err = char.WriteWithoutResponse(buf)
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
 			default:
-				fmt.Println("unknown command", msg.Method)
+				fmt.Printf("unknown command '%s' with params: %+v\n", msg.Method, msg.DebugParams())
 			}
 		}
 
