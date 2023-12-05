@@ -405,6 +405,7 @@ func ble() {
 				}
 
 				fmt.Println("scanning...")
+				// TODO: scan should be async
 				err = adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
 					if len(device.LocalName()) == 0 {
 						return
