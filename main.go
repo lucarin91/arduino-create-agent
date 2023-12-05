@@ -196,11 +196,28 @@ func NewMsg(method string, params interface{}) Msg {
 	}
 }
 
-func (m Msg) Respond(result interface{}) Result {
+func (m Msg) RespondBytes(buf []byte) Result {
+	return Result{
+		Id:       m.Id,
+		Jsonrpc:  "2.0",
+		Encoding: "base64",
+		Result:   base64.StdEncoding.EncodeToString(buf),
+	}
+}
+
+func (m Msg) Respond(data interface{}) Result {
 	return Result{
 		Id:      m.Id,
 		Jsonrpc: "2.0",
-		Result:  result,
+		Result:  data,
+	}
+}
+
+func (m Msg) Error(err string) Error {
+	return Error{
+		Id:      m.Id,
+		Jsonrpc: "2.0",
+		Error:   err,
 	}
 }
 
@@ -214,9 +231,16 @@ func (m Msg) DebugParams() map[string]interface{} {
 }
 
 type Result struct {
-	Id      int64       `json:"id"`
-	Jsonrpc string      `json:"jsonrpc"`
-	Result  interface{} `json:"result"`
+	Id       int64       `json:"id"`
+	Jsonrpc  string      `json:"jsonrpc"`
+	Result   interface{} `json:"result"`
+	Encoding string      `json:"encoding,omitempty"`
+}
+
+type Error struct {
+	Id      int64  `json:"id"`
+	Jsonrpc string `json:"jsonrpc"`
+	Error   string `json:"error"`
 }
 
 type Device struct {
@@ -239,7 +263,7 @@ type ConnectParams struct {
 	PeripheralId string `json:"peripheralId"`
 }
 
-type StartNotificationsParams struct {
+type NotificationsParams struct {
 	ServiceId        uuid.UUID `json:"serviceId"`
 	CharacteristicId uuid.UUID `json:"characteristicId"`
 }
@@ -248,10 +272,18 @@ type UpdateParams struct {
 	ServiceId        uuid.UUID `json:"serviceId"`
 	CharacteristicId uuid.UUID `json:"characteristicId"`
 	Message          string    `json:"message"`
-	Encoding         string    `json:"encoding"`
+	Encoding         string    `json:"encoding,omitempty"`
+	WithResponse     bool      `json:"withResponse"`
+}
+
+type ReadParams struct {
+	ServiceId          uuid.UUID `json:"serviceId"`
+	CharacteristicId   uuid.UUID `json:"characteristicId"`
+	StartNotifications bool      `json:"startNotifications"`
 }
 
 func WsSend(c *websocket.Conn, data interface{}) error {
+	// fmt.Printf("[DEBUG] sending: %+v\n", data)
 	buff, err := json.Marshal(data)
 	if err != nil {
 		panic(err)
@@ -356,11 +388,19 @@ func ble() {
 			}
 
 			switch msg.Method {
+			case "getVersion":
+				err := WsSend(c, msg.Respond(map[string]string{"protocol": "1.3"}))
+				if err != nil {
+					fmt.Printf("err: %s", err)
+					continue
+				}
+
 			case "discover":
 				var params DiscoverParams
 				err := json.Unmarshal(msg.Params, &params)
 				if err != nil {
 					fmt.Printf("err: %s\n", err)
+					WsSend(c, msg.Error(err.Error()))
 					continue
 				}
 
@@ -394,26 +434,34 @@ func ble() {
 				})
 				if err != nil {
 					fmt.Printf("error: %s", err)
+					WsSend(c, msg.Error(err.Error()))
 					continue
 				}
+
+				err = WsSend(c, msg.Respond(nil))
+				if err != nil {
+					fmt.Printf("err: %s", err)
+					continue
+				}
+
 			case "connect":
 				var params ConnectParams
 				err := json.Unmarshal(msg.Params, &params)
 				if err != nil {
 					fmt.Printf("error: %s", err)
+					WsSend(c, msg.Error(err.Error()))
 					continue
 				}
 
-				mac := bluetooth.MACAddress{}
+				mac := bluetooth.Address{}
 				mac.Set(params.PeripheralId)
-				DEVICE, err = adapter.Connect(bluetooth.Address{
-					MACAddress: mac,
-				}, bluetooth.ConnectionParams{
+				DEVICE, err = adapter.Connect(mac, bluetooth.ConnectionParams{
 					ConnectionTimeout: 0,
 					MinInterval:       0,
 					MaxInterval:       0,
 				})
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("error: %s", err)
 					continue
 				}
@@ -422,80 +470,154 @@ func ble() {
 				err = WsSend(c, msg.Respond(nil))
 				if err != nil {
 					fmt.Printf("err: %s", err)
-					return
+					continue
 				}
 
 			case "startNotifications":
-				var params StartNotificationsParams
+				var params NotificationsParams
 				err := json.Unmarshal(msg.Params, &params)
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
 				fmt.Printf("startNotifications params: %+v\n", params)
 
-				services, err := DEVICE.DiscoverServices([]bluetooth.UUID{bluetooth.NewUUID(params.ServiceId)})
+				char, err := getDeviceCharacteristic(*DEVICE, bluetooth.NewUUID(params.ServiceId), bluetooth.NewUUID(params.CharacteristicId))
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
 
-				chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{bluetooth.NewUUID(params.CharacteristicId)})
+				err = char.EnableNotifications(notificationCallback(c, params.CharacteristicId, params.CharacteristicId))
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
 
-				chars[0].EnableNotifications(func(buf []byte) {
-					// fmt.Printf("get char notification: %v\n", buf)
-					err := WsSend(c, NewMsg("characteristicDidChange", UpdateParams{
-						ServiceId:        params.ServiceId,
-						CharacteristicId: params.CharacteristicId,
-						Message:          base64.StdEncoding.EncodeToString(buf),
-						Encoding:         "base64",
-					}))
+				err = WsSend(c, msg.Respond(nil))
 					if err != nil {
-						fmt.Printf("err: %s\n", err)
+					fmt.Printf("err: %s", err)
+					continue
 					}
-				})
+
 			case "write":
 				var params UpdateParams
 				err := json.Unmarshal(msg.Params, &params)
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
 				fmt.Printf("write params: %+v\n", params)
 
+				if params.Encoding != "base64" {
+					panic("encoding format not supported")
+				}
+
 				services, err := DEVICE.DiscoverServices([]bluetooth.UUID{bluetooth.NewUUID(params.ServiceId)})
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
 
 				chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{bluetooth.NewUUID(params.CharacteristicId)})
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
 				char := chars[0]
 
-				if params.Encoding != "base64" {
-					panic("encoding format not supported")
-				}
-
 				buf, err := base64.StdEncoding.DecodeString(params.Message)
 				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
-				_, err = char.WriteWithoutResponse(buf)
+
+				// TODO: handle params.WithResponse
+				n, err := char.WriteWithoutResponse(buf)
+				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
+				err = WsSend(c, msg.Respond(n))
 				if err != nil {
 					fmt.Printf("err: %s\n", err)
 					continue
 				}
+
+			case "read":
+				var params ReadParams
+				err := json.Unmarshal(msg.Params, &params)
+				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+				fmt.Printf("read params: %+v\n", params)
+
+				char, err := getDeviceCharacteristic(*DEVICE, bluetooth.NewUUID(params.ServiceId), bluetooth.NewUUID(params.CharacteristicId))
+				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
+				if params.StartNotifications {
+					err = char.EnableNotifications(notificationCallback(c, params.CharacteristicId, params.CharacteristicId))
+					if err != nil {
+						WsSend(c, msg.Error(err.Error()))
+						fmt.Printf("err: %s\n", err)
+						continue
+					}
+				}
+
+				buf := make([]byte, 512)
+				n, err := char.Read(buf)
+				err = WsSend(c, msg.RespondBytes(buf[:n]))
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
+			case "stopNotifications":
+				var params NotificationsParams
+				err := json.Unmarshal(msg.Params, &params)
+				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+				fmt.Printf("stopNotifications params: %+v\n", params)
+
+				char, err := getDeviceCharacteristic(*DEVICE, bluetooth.NewUUID(params.ServiceId), bluetooth.NewUUID(params.CharacteristicId))
+				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
+				err = char.EnableNotifications(nil)
+				if err != nil {
+					WsSend(c, msg.Error(err.Error()))
+					continue
+				}
+
+				err = WsSend(c, msg.Respond(nil))
+				if err != nil {
+					fmt.Printf("err: %s\n", err)
+					continue
+				}
+
 			default:
-				fmt.Printf("unknown command '%s' with params: %+v\n", msg.Method, msg.DebugParams())
+				panic(fmt.Sprintf("unknown command '%s' with params: %+v\n", msg.Method, msg.DebugParams()))
 			}
 		}
 
@@ -504,6 +626,35 @@ func ble() {
 	err := http.ListenAndServeTLS(":20110", "server.crt", "server.key", nil)
 	if err != nil {
 		panic("ListenAndServe: " + err.Error())
+	}
+}
+
+func getDeviceCharacteristic(device bluetooth.Device, serviceId, characteristicId bluetooth.UUID) (bluetooth.DeviceCharacteristic, error) {
+	services, err := device.DiscoverServices([]bluetooth.UUID{serviceId})
+	if err != nil {
+		return bluetooth.DeviceCharacteristic{}, err
+	}
+
+	chars, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{characteristicId})
+	if err != nil {
+		return bluetooth.DeviceCharacteristic{}, err
+	}
+
+	return chars[0], nil
+}
+
+func notificationCallback(c *websocket.Conn, ServiceId, CharacteristicId uuid.UUID) func(buf []byte) {
+	return func(buf []byte) {
+		err := WsSend(c, NewMsg("characteristicDidChange", UpdateParams{
+			ServiceId:        ServiceId,
+			CharacteristicId: CharacteristicId,
+			Message:          base64.StdEncoding.EncodeToString(buf),
+			Encoding:         "base64",
+		}))
+		if err != nil {
+			fmt.Printf("err: %s\n", err)
+			return
+		}
 	}
 }
 
