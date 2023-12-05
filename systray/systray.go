@@ -40,6 +40,8 @@ type Systray struct {
 	path string
 	// The path of the configuration file
 	currentConfigFilePath *paths.Path
+
+	InstallLabsScrathFirmware func()
 }
 
 // Restart restarts the program

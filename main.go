@@ -19,6 +19,7 @@
 package main
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -44,6 +45,8 @@ import (
 	"github.com/arduino/arduino-create-agent/systray"
 	"github.com/arduino/arduino-create-agent/tools"
 	"github.com/arduino/arduino-create-agent/updater"
+	"github.com/arduino/arduino-create-agent/upload"
+	"github.com/arduino/arduino-create-agent/utilities"
 	v2 "github.com/arduino/arduino-create-agent/v2"
 	paths "github.com/arduino/go-paths-helper"
 	"github.com/gin-gonic/gin"
@@ -157,8 +160,9 @@ func main() {
 		DebugURL: func() string {
 			return "http://" + *address + port
 		},
-		AdditionalConfig: *additionalConfig,
-		ConfigDir:        configDir,
+		AdditionalConfig:          *additionalConfig,
+		ConfigDir:                 configDir,
+		InstallLabsScrathFirmware: InstallLabsScrathFirmware,
 	}
 
 	if src, err := os.Executable(); err != nil {
@@ -170,8 +174,41 @@ func main() {
 	}
 }
 
-var allowOriginFunc = func(r *http.Request) bool {
-	return true
+//go:embed BLE_Scratch.ino.bin
+var ScratchFirmwareHex []byte
+
+func InstallLabsScrathFirmware() {
+	l := PLogger{Verbose: true}
+
+	buffer := bytes.NewBuffer(ScratchFirmwareHex)
+
+	filePath, err := utilities.SaveFileonTempDir("BLE_Scratch.ino.bin", buffer)
+	if err != nil {
+		fmt.Printf("err: %s\n", err)
+		return
+	}
+
+	// TODO: should get the bord port
+	port := "/dev/ttyACM0"
+	board := "arduino:mbed_nano:nano33ble"
+	cmdTemp := `"{runtime.tools.bossac-1.9.1-arduino2.path}/bossac" -d --port={serial.port.file} -U -i -e -w "{build.path}/{build.project_name}.bin" -R `
+	extra := upload.Extra{Use1200bpsTouch: true, WaitForUploadPort: true, Network: false, SSH: false}
+
+	cmd, err := upload.PartiallyResolve(board, filePath, "/tmp", cmdTemp, extra, &Tools)
+	if err != nil {
+		fmt.Printf("err: %s\n", err)
+		return
+	}
+
+	err = upload.Serial(
+		port,
+		cmd,
+		extra,
+		l)
+	if err != nil {
+		fmt.Printf("err: %s\n", err)
+		return
+	}
 }
 
 var MsgID int64 = 0

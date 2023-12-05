@@ -74,6 +74,9 @@ func (s *Systray) start() {
 		s.updateMenuItem(mGenCerts, config.CertsExist())
 	}
 
+	mLabs := systray.AddMenuItem("labs", "")
+	mLabsInstall := mLabs.AddSubMenuItem("Install scratch firmware", "")
+
 	// Add pause/quit
 	mPause := systray.AddMenuItem("Pause Agent", "")
 	systray.AddSeparator()
@@ -105,6 +108,10 @@ func (s *Systray) start() {
 					cert.DeleteCertificates(certDir)
 				}
 				s.Restart()
+			case <-mLabsInstall.ClickedCh:
+				mLabsInstall.Disable()
+				s.InstallLabsScrathFirmware()
+				mLabsInstall.Enable()
 			case <-mPause.ClickedCh:
 				s.Pause()
 			case <-mQuit.ClickedCh:
