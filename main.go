@@ -498,10 +498,10 @@ func ble() {
 				}
 
 				err = WsSend(c, msg.Respond(nil))
-					if err != nil {
+				if err != nil {
 					fmt.Printf("err: %s", err)
 					continue
-					}
+				}
 
 			case "write":
 				var params UpdateParams
@@ -622,8 +622,8 @@ func ble() {
 		}
 
 	}))
-	// err := http.ListenAndServeTLS(":20111", "server.crt", "server.key", nil)
-	err := http.ListenAndServeTLS(":20110", "server.crt", "server.key", nil)
+
+	err := http.ListenAndServe(":20111", nil)
 	if err != nil {
 		panic("ListenAndServe: " + err.Error())
 	}
