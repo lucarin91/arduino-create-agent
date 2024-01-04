@@ -14,8 +14,7 @@ func GetHandler(adapter *bluetooth.Adapter) websocket.Handler {
 
 		var DEVICE *bluetooth.Device
 
-		msgs := make(chan Msg, 100)
-		go WsReadLoop(c, msgs)
+		msgs := WsReadLoop(c)
 
 		for msg := range msgs {
 			switch msg.Method {
@@ -29,39 +28,12 @@ func GetHandler(adapter *bluetooth.Adapter) websocket.Handler {
 					continue
 				}
 
-				// TODO: scan should be async
-				err = adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
-					if len(device.LocalName()) == 0 {
-						return
+				devices := startAsyncScan(adapter, params.Filters)
+				go func() {
+					for device := range devices {
+						_ = WsSend(c, NewMsg("didDiscoverPeripheral", device))
 					}
-
-					log.Debug("found device:", device.Address.String(), device.RSSI, device.LocalName())
-
-					if !matchDevice(device, params.Filters) {
-						return
-					}
-
-					if err := adapter.StopScan(); err != nil {
-						log.Errorf("stop scan error: %s\n", err)
-						return
-					}
-
-					msg := NewMsg("didDiscoverPeripheral", Device{
-						PeripheralId: device.Address.String(),
-						Name:         device.LocalName(),
-						RSSI:         device.RSSI,
-					})
-
-					err := WsSend(c, msg)
-					if err != nil {
-						return
-					}
-				})
-				if err != nil {
-					log.Errorf("scan error: %s", err)
-					_ = WsSend(c, msg.Error(err.Error()))
-					continue
-				}
+				}()
 
 				_ = WsSend(c, msg.Respond(nil))
 
@@ -71,6 +43,8 @@ func GetHandler(adapter *bluetooth.Adapter) websocket.Handler {
 					_ = WsSend(c, msg.Error(err.Error()))
 					continue
 				}
+
+				_ = adapter.StopScan()
 
 				mac := bluetooth.Address{}
 				mac.Set(params.PeripheralId)
@@ -216,5 +190,6 @@ func GetHandler(adapter *bluetooth.Adapter) websocket.Handler {
 			}
 		}
 
+		log.Printf("client disconnected from %q\n", c.RemoteAddr())
 	})
 }

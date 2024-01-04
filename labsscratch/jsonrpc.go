@@ -3,6 +3,7 @@ package labsscratch
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -94,15 +95,25 @@ func WsSend[T Msg | Error | Result](c *websocket.Conn, data T) error {
 	return nil
 }
 
-func WsReadLoop(c *websocket.Conn, out chan<- Msg) {
-	for {
-		msg, err := wsRead(c)
-		if err != nil {
-			log.Printf("ws read error: %s\n", err)
-			continue
+func WsReadLoop(c *websocket.Conn) <-chan Msg {
+	out := make(chan Msg, 100)
+
+	func() {
+		defer close(out)
+		for {
+			msg, err := wsRead(c)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				log.Warnf("read loop error: %s, ignore\n", err)
+				return
+			}
+			out <- msg
 		}
-		out <- msg
-	}
+	}()
+
+	return out
 }
 
 func wsRead(c *websocket.Conn) (Msg, error) {
@@ -110,11 +121,8 @@ func wsRead(c *websocket.Conn) (Msg, error) {
 	var msg Msg
 	for {
 		n, err := c.Read(buff)
-		if err == io.EOF {
-			continue
-		}
 		if err != nil {
-			return msg, fmt.Errorf("ws read error: %w", err)
+			return msg, fmt.Errorf("ws read: %w", err)
 		}
 		if n >= 512 {
 			panic("too big")

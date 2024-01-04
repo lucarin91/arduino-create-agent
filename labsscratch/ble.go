@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 
 	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/websocket"
 	"tinygo.org/x/bluetooth"
 )
@@ -76,4 +77,40 @@ func notificationCallback(c *websocket.Conn, ServiceId, CharacteristicId uuid.UU
 			Encoding:         "base64",
 		}))
 	}
+}
+
+func startAsyncScan(adapter *bluetooth.Adapter, filter []DiscoverFilter) <-chan Device {
+	// Stop previus scan (if any).
+	_ = adapter.StopScan()
+
+	devices := make(chan Device, 10)
+
+	go func() {
+		defer close(devices)
+
+		err := adapter.Scan(func(adapter *bluetooth.Adapter, device bluetooth.ScanResult) {
+			if len(device.LocalName()) == 0 {
+				return
+			}
+
+			adapter.StopScan()
+
+			log.Debug("found device:", device.Address.String(), device.RSSI, device.LocalName())
+
+			if !matchDevice(device, filter) {
+				return
+			}
+
+			devices <- Device{
+				PeripheralId: device.Address.String(),
+				Name:         device.LocalName(),
+				RSSI:         device.RSSI,
+			}
+		})
+		if err != nil {
+			log.Errorf("scan error: %s", err)
+		}
+	}()
+
+	return devices
 }
