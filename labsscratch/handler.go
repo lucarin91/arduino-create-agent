@@ -10,6 +10,8 @@ import (
 
 func GetHandler(adapter *bluetooth.Adapter) websocket.Handler {
 	return websocket.Handler(func(c *websocket.Conn) {
+		log.SetLevel(log.DebugLevel)
+
 		log.Printf("client connected from %q\n", c.RemoteAddr())
 
 		var DEVICE *bluetooth.Device
@@ -17,6 +19,8 @@ func GetHandler(adapter *bluetooth.Adapter) websocket.Handler {
 		msgs := WsReadLoop(c)
 
 		for msg := range msgs {
+			log.Debugf("get message: %v\n", msg)
+
 			switch msg.Method {
 			case "getVersion":
 				_ = WsSend(c, msg.Respond(map[string]string{"protocol": "1.3"}))

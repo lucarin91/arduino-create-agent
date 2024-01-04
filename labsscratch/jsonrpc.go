@@ -98,7 +98,7 @@ func WsSend[T Msg | Error | Result](c *websocket.Conn, data T) error {
 func WsReadLoop(c *websocket.Conn) <-chan Msg {
 	out := make(chan Msg, 100)
 
-	func() {
+	go func() {
 		defer close(out)
 		for {
 			msg, err := wsRead(c)

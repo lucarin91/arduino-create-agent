@@ -93,8 +93,6 @@ func startAsyncScan(adapter *bluetooth.Adapter, filter []DiscoverFilter) <-chan 
 				return
 			}
 
-			adapter.StopScan()
-
 			log.Debug("found device:", device.Address.String(), device.RSSI, device.LocalName())
 
 			if !matchDevice(device, filter) {
